@@ -2,7 +2,7 @@ title: Kilpatrickt Blog
 description: Notes on technology, learning, and everyday thinking.
 author: Kilpatrickt
 url: "https://kilpatrickt.github.io"
-baseurl: "/Kipatrickt.github.io"
+baseurl: ""
 lang: zh-CN
 timezone: Asia/Shanghai
 

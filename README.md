@@ -38,28 +38,10 @@ description: "一句话摘要"
 
 保存后等待 GitHub Pages 自动部署。
 
-## 关于当前仓库名
+## 访问地址
 
-当前仓库地址是 `Kilpatrickt/Kipatrickt.github.io`，仓库名少了用户名里的字母 `l`。因此它更像项目站点，默认访问地址通常是：
-
-```text
-https://kilpatrickt.github.io/Kipatrickt.github.io/
-```
-
-如果你想使用更标准的个人主页地址：
+仓库名改为 `Kilpatrickt.github.io` 后，这是一个标准 GitHub Pages 个人主页仓库。发布成功后访问地址是：
 
 ```text
 https://kilpatrickt.github.io/
-```
-
-建议把仓库名改成：
-
-```text
-Kilpatrickt.github.io
-```
-
-改名后，把 `_config.yml` 里的 `baseurl` 改成空字符串：
-
-```yaml
-baseurl: ""
 ```
