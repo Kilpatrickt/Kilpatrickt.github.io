@@ -1,0 +1,21 @@
+---
+layout: default
+title: 归档
+permalink: /archive/
+---
+
+<section class="page-shell">
+  <p class="eyebrow">Archive</p>
+  <h1>文章归档</h1>
+
+  <div class="archive-list">
+    {% for post in site.posts %}
+      <a class="archive-item" href="{{ post.url | relative_url }}">
+        <time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%Y.%m.%d" }}</time>
+        <span>{{ post.title }}</span>
+      </a>
+    {% else %}
+      <p class="empty-state">暂无文章。</p>
+    {% endfor %}
+  </div>
+</section>

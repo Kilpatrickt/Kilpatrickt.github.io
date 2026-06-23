@@ -1,0 +1,26 @@
+---
+layout: default
+---
+
+<article class="post-shell">
+  <header class="post-header">
+    <p class="eyebrow">{{ page.date | date: "%Y.%m.%d" }}</p>
+    <h1>{{ page.title }}</h1>
+    {% if page.description %}
+      <p class="post-description">{{ page.description }}</p>
+    {% endif %}
+  </header>
+
+  <div class="post-content">
+    {{ content }}
+  </div>
+
+  <nav class="post-links" aria-label="Post navigation">
+    {% if page.previous %}
+      <a href="{{ page.previous.url | relative_url }}">上一篇：{{ page.previous.title }}</a>
+    {% endif %}
+    {% if page.next %}
+      <a href="{{ page.next.url | relative_url }}">下一篇：{{ page.next.title }}</a>
+    {% endif %}
+  </nav>
+</article>

@@ -1,0 +1,40 @@
+---
+layout: default
+title: 首页
+---
+
+<section class="hero">
+  <div class="hero-copy">
+    <p class="eyebrow">Personal Blog</p>
+    <h1>记录技术、学习和生活里的清醒时刻。</h1>
+    <p>
+      这里是 Kilpatrickt 的个人博客，用来整理长期值得回看的笔记、项目复盘和一点日常观察。
+    </p>
+  </div>
+  <div class="hero-visual">
+    <img src="{{ '/assets/img/blog-cover.png' | relative_url }}" alt="Illustration of a writing desk with notes and cards">
+  </div>
+</section>
+
+<section class="content-section">
+  <div class="section-heading">
+    <p class="eyebrow">Latest</p>
+    <h2>最新文章</h2>
+  </div>
+
+  <div class="post-list">
+    {% for post in site.posts %}
+      <article class="post-card">
+        <p class="post-date">{{ post.date | date: "%Y.%m.%d" }}</p>
+        <h3><a href="{{ post.url | relative_url }}">{{ post.title }}</a></h3>
+        {% if post.description %}
+          <p>{{ post.description }}</p>
+        {% else %}
+          <p>{{ post.excerpt | strip_html | truncate: 120 }}</p>
+        {% endif %}
+      </article>
+    {% else %}
+      <p class="empty-state">还没有文章。把 Markdown 文件放进 <code>_posts</code> 目录后，它们会出现在这里。</p>
+    {% endfor %}
+  </div>
+</section>

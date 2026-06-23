@@ -1,0 +1,31 @@
+title: Kilpatrickt Blog
+description: Notes on technology, learning, and everyday thinking.
+author: Kilpatrickt
+url: "https://kilpatrickt.github.io"
+baseurl: "/Kipatrickt.github.io"
+lang: zh-CN
+timezone: Asia/Shanghai
+
+permalink: /:year/:month/:day/:title/
+
+collections:
+  posts:
+    output: true
+
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: post
+
+markdown: kramdown
+kramdown:
+  input: GFM
+
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - .bundle
