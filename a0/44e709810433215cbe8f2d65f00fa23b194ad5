@@ -1,0 +1,66 @@
+_posts/2026-07-21-redis-scheduler-tutorial.md
+  s_93c4cc7a49729b::t_aef1737cf04976 1-1146 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5f805c8dc8254fad61e6a9","tool_type":"agent","tool_id":"Write","line_ranges":[{"Range":[1,1146]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a044e709810433215cbe8f2d65f00fa23b194ad5",
+  "prompts": {},
+  "sessions": {
+    "s_93c4cc7a49729b": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a5f292d8dc8254fad61e521",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "guozhiyuan.leo <guozhiyuan.leo@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "_posts/2026-07-21-redis-scheduler-tutorial.md": [
+      {
+        "hash": "s_93c4cc7a49729b::t_aef1737cf04976",
+        "line_ranges": [
+          {
+            "Range": [
+              1,
+              1146
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5f805c8dc8254fad61e6a9",
+            "tool_type": "agent",
+            "tool_id": "Write",
+            "line_ranges": [
+              {
+                "Range": [
+                  1,
+                  1146
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_93c4cc7a49729b": {
+      "tool": "trae",
+      "conversation_id": "6a5f292d8dc8254fad61e521",
+      "session_id": "6a5f292d8dc8254fad61e521",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_93c4cc7a49729b::t_aef1737cf04976": {
+      "tool": "trae",
+      "conversation_id": "6a5f292d8dc8254fad61e521",
+      "session_id": "6a5f292d8dc8254fad61e521",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
