@@ -1,96 +1,90 @@
 ---
-title: "Redis 队列调度实战：从 API 小白到能读懂线上 leader/worker"
+title: "Redis 队列调度实战：从零到读懂线上代码"
 date: 2026-07-21 21:00:00 +0800
-description: "从 Redis 五种核心数据结构讲起，一步步搭出分布式锁、优先级队列、visibility timeout、分布式信号量，最后把每一段基础 API 对应到线上真实的 leader/worker 代码。"
+description: "这不是官方文档的翻译。我会带你从生活场景出发理解 Redis 到底在解决什么问题，一步步把小玩具搭成能扛住 10 台机器同时跑的调度系统，最后把每一行操作对应到真实生产代码。"
 tags: [Redis, Python, Distributed Systems, Scheduling]
 permalink: /2026/07/21/redis-scheduler-tutorial/
 ---
 
-> 这份教程写给"知道 Redis 是个 KV 数据库、但没真正用它做过调度系统"的同学。你不需要提前懂分布式锁、visibility timeout、分布式信号量这些黑话。我们会从 Redis 最基础的 API 讲起,一步步搭出一个完整的多机调度框架,最后把每一段基础 API 对应到线上真实生产代码(fragment 生产系统的 leader/worker)。
-
-> 学习目标:读完这份教程你应该能
+> 这份教程写给这样的你：
+> - **知道 Redis 存在，但没真正用它写过东西**
+> - 看过一些"分布式锁"、"任务队列"的文章，但读完还是一脸懵
+> - 手头正好有一个"多台机器一起处理任务、不能重复不能漏"的场景
 >
-> - 熟练使用 Redis 五种核心数据结构(String / Hash / List / Set / ZSET)
-> - 理解 `NX / XX / EX / PX` 四个参数,它们是 Redis 分布式的灵魂
-> - 从零手写一个健壮的分布式锁(带 fencing token + 自动续期)
-> - 从零手写一个带优先级、可自愈的任务队列
-> - 读懂真实线上系统的 `leader_loop` 和 `process_one` 每一行
+> 我不打算堆黑话。每讲一个概念，我先讲**日常生活里同样的问题是怎么解决的**，再讲代码。你会发现分布式系统里那些吓人的名词，本质上都是"一群人一起干活时怎么不打架"的常识。
 
-> 示例默认用 Python 3.11+ 的 `redis` 官方库(不是 `aioredis`,那个已经合并进 `redis` 了)。
+---
 
 ## 目录
 
-1. Redis 是什么、为什么用它做调度
-2. 环境准备:安装 Redis 和 Python 客户端
-3. 五种核心数据结构:够用 95% 的场景
-4. TTL(过期时间):Redis 自愈的魔法
-5. 分布式锁:从最朴素到生产可用
-6. Lua 脚本:原子性利器
-7. 优先级队列:ZSET 的正确用法
-8. Visibility timeout:任务不丢的秘密
-9. 分布式信号量:全局并发限流
-10. QPS 时间槽:下游红线保护
-11. 把所有东西拼起来:一个最小可用调度器
-12. 对应到线上代码:leader.py 逐段拆解
-13. 对应到线上代码:worker.py 逐段拆解
-14. 常见坑与调试技巧
+1. 先讲个故事：Redis 到底解决什么问题
+2. 装个 Redis，敲第一行命令
+3. 五种数据结构：一句话记住每种是干嘛的
+4. 过期时间：Redis 最神奇的一个特性
+5. 分布式锁：三个版本演进，每一版都有 bug 等着你踩
+6. Lua 脚本：为什么它是绕不开的
+7. 优先级队列：怎么让 VIP 单永远排最前面
+8. 隐身机制：任务取走后还能"回来"
+9. 全局并发信号量：10 台机器加起来最多同时干 6 个
+10. QPS 时间槽：保护脆弱的下游
+11. 把所有零件拼起来：一个能跑的调度器
+12. 对着看线上代码：leader.py 每一段在干嘛
+13. 对着看线上代码：worker.py 每一段在干嘛
+14. 你会踩的坑
+15. 一句话总结
 
 ---
 
-## 1. Redis 是什么、为什么用它做调度
+## 1. 先讲个故事：Redis 到底解决什么问题
 
-一句话:**一个跑在内存里的、支持复杂数据结构的键值数据库**。
+想象你开了家餐厅，只有你一个人。客人点单直接告诉你，你写在小本子上，做完划掉。没有任何"并发"问题——因为只有一个人。
 
-对比一下:
+现在生意好了，你雇了 10 个厨师。**问题来了**：
 
-| | MySQL/Mongo | Redis |
-|---|---|---|
-| 存哪 | 磁盘 | 内存 |
-| 速度 | 毫秒级 | 微秒级(100 倍以上) |
-| 数据模型 | 表/文档 | 8 种数据结构 |
-| 用途 | 存"真相" | 缓存、队列、锁、计数器 |
+- 客人的单子写哪？如果每个厨师有自己的小本子，同一桌菜可能做 10 遍
+- 谁来分单？如果 10 个人一起抢单，可能抢到打起来
+- VIP 客人的菜要先做，怎么办？
+- 一个厨师做菜做一半晕倒了，他手上那单谁来接？
 
-**心智模型**:Redis 是一本"便签簿",每条便签是 `key → value`。value 不只是字符串,还可以是列表、集合、哈希表等复杂结构。
+这就是"多台机器一起干活"要面对的所有问题。而 Redis，本质上是**厨房中间那块所有人都能看到的公共白板**。
 
-**为什么用它做调度**:
+- 客人的单子 → 写在白板上
+- 谁抢到就在白板上盖个"我的"章
+- VIP 单子写得靠前一点
+- 厨师晕倒？白板上的"我的"章有个"5 分钟自动消失"的墨水
 
-1. **原子操作**:很多 Redis 命令是原子的,多进程同时操作不会打架
-2. **过期时间**:每个 key 都可以设自动过期,这让"崩溃自愈"变得极其简单
-3. **数据结构丰富**:ZSET 天然支持"按优先级排序",队列直接用它就够
-4. **速度快**:调度系统最怕慢,毫秒级的 Redis 是 sweet spot
+Redis 的所有牛逼之处，其实就这几个：**大家都能看到**、**改动是原子的（不会改一半）**、**能设过期时间**。
 
 ---
 
-## 2. 环境准备
+## 2. 装个 Redis，敲第一行命令
 
-### 装 Redis 服务
-
-Mac:
+Mac 用户：
 
 ```bash
 brew install redis
 brew services start redis
 ```
 
-### 装 Python 客户端
+装个 Python 客户端：
 
 ```bash
 pip install redis
 ```
 
-### 第一次连接
+连上试试：
 
 ```python
 import redis
 
+# decode_responses=True 让返回值是字符串而不是 bytes，别忘了这个参数
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-# decode_responses=True:让返回值自动解成 str,不然是 bytes
 
 r.set("hello", "world")
-print(r.get("hello"))  # 'world'
+print(r.get("hello"))   # 'world'
 ```
 
-**异步版**(线上生产用这个):
+线上生产用的是异步版：
 
 ```python
 import redis.asyncio as redis
@@ -100,238 +94,296 @@ async def main():
     r = redis.Redis(host="localhost", port=6379, decode_responses=True)
     await r.set("hello", "world")
     print(await r.get("hello"))
-    await r.aclose()
 
 asyncio.run(main())
 ```
 
-**记住**:异步 API 每个命令前加 `await`,其他跟同步一样。下面示例我都用同步版方便读。
+**唯一区别**：每个命令前加 `await`。下面为了好读我都用同步版写。
 
 ---
 
-## 3. 五种核心数据结构
+## 3. 五种数据结构：一句话记住每种是干嘛的
 
-### 3.1 String — 最基础
+Redis 支持很多种数据结构，但你日常 95% 的活儿只需要这 5 种。我先给你一句话记忆：
 
-**能存**:字符串、数字、二进制。
+| 结构 | 一句话 | 什么时候用 |
+|---|---|---|
+| **String** | 一个 key 存一个值 | 缓存、计数器、锁 |
+| **Hash** | 一个 key 下面挂一个字典 | 存"对象"，改单字段方便 |
+| **List** | 一根双向链表 | 简单的 FIFO 队列 |
+| **Set** | 一个不重复的集合 | 标签、去重、朋友圈 |
+| **ZSET** | Set 但每个元素带个分数，自动排序 | **优先级队列** |
+
+下面一个个讲。你不用记 API，看懂在干嘛就行。真用的时候翻回来查。
+
+### 3.1 String：最简单也最常用
 
 ```python
-# 最基本
+# 存和取
 r.set("name", "Alice")
-r.get("name")           # 'Alice'
-r.delete("name")
+r.get("name")             # 'Alice'
 
-# 计数器(原子递增,多进程安全)
+# 计数（重点：原子的，10 台机器同时 incr 结果也对）
 r.set("counter", 0)
-r.incr("counter")       # 1
-r.incr("counter")       # 2
-r.incrby("counter", 10) # 12
-r.decr("counter")       # 11
-
-# 带过期时间(TTL)
-r.set("token", "xyz", ex=60)     # 60 秒后自动删
-r.set("token", "xyz", px=60000)  # 60000 毫秒
-r.ttl("token")                   # 查剩余秒数:60
-
-# 只在不存在时设置(关键 API!)
-r.set("lock", "me", nx=True)     # 存在则返回 None,不覆盖
+r.incr("counter")         # 1
+r.incr("counter")         # 2
+r.incrby("counter", 100)  # 102
 ```
 
-`nx=True` 让 SET 变成**原子的"如果不存在才设置"**,是所有分布式锁的基石。
-
-### 3.2 Hash — 存"对象"
-
-**心智模型**:一个 key 下面挂一个字典。
+看到"原子的"这个词你可能没感觉。**举个例子**：
 
 ```python
+# ❌ 错误示范
+n = int(r.get("counter"))
+r.set("counter", n + 1)
+```
+
+10 个进程都这么写，会发生什么？
+
+- 进程 A 读到 counter = 5
+- 进程 B 也读到 counter = 5
+- A 写回 6
+- B 写回 6
+
+明明 +2 应该是 7，结果是 6。**这就叫"竞态条件"**。你在多机场景反复会遇到它。
+
+`INCR` 一条命令，Redis 内部帮你搞定了这个问题。**这是 Redis 分布式能力的基础**：把"读+改+写"合并成一条原子命令。
+
+### 3.2 String 里最重要的 4 个参数
+
+```python
+r.set("token", "xyz", ex=60)     # 60 秒后自动删（单位：秒）
+r.set("token", "xyz", px=60000)  # 60000 毫秒后自动删
+r.set("lock", "me", nx=True)     # 只在 key 不存在时才设置
+r.set("lock", "me", xx=True)     # 只在 key 已存在时才设置
+```
+
+这 4 个参数（`ex / px / nx / xx`）是 Redis 分布式系统的灵魂。**你只要记住**：
+
+- **`ex/px`**：让 key 过一段时间自己消失。**这就是崩溃自愈的基础**——进程死了，锁不用手动释放
+- **`nx`**：让 SET 变成 "不存在才设置"。**这就是抢锁的基础**——第一个 SET 上的人赢
+- **`xx`**：让 SET 变成 "存在才设置"。用来更新，不用来创建
+
+而且它们可以组合：
+
+```python
+r.set("lock:job:123", "me", nx=True, ex=60)
+```
+
+这一条命令的意思是：**"如果这把锁没人拿，我拿走，60 秒后自动释放"**。这就是分布式锁的全部——一行代码。
+
+### 3.3 Hash：存对象
+
+想存一个用户？
+
+```python
+# 一次性写多个字段
 r.hset("user:1000", mapping={
     "name": "Alice",
     "age": "30",
-    "email": "a@x.com",
 })
 
 r.hget("user:1000", "name")        # 'Alice'
-r.hgetall("user:1000")             # {'name': 'Alice', ...}
-r.hincrby("user:1000", "age", 1)   # age 从 30 → 31
-r.hdel("user:1000", "email")
-r.hlen("user:1000")                # 字段数
+r.hgetall("user:1000")             # {'name': 'Alice', 'age': '30'}
+r.hincrby("user:1000", "age", 1)   # 只改 age 字段，不影响 name
 ```
 
-**什么时候用 Hash 而不是 JSON 字符串**:
+**Hash vs JSON 字符串**：
 
-- 只想改某个字段 → Hash(不用读整个反序列化再写回)
-- 要按字段计数 → Hash + HINCRBY
-- 整体读写 → JSON 也行
+- 用 JSON：每次改一个字段都要读整个 JSON、反序列化、改、序列化、写回
+- 用 Hash：只改要改的字段，其他字段不动
 
-### 3.3 List — 队列/栈
+如果字段之间独立、经常单独更新 → Hash 完胜。
 
-**心智模型**:一个可以两头进出的双向链表。
+### 3.4 List：简单队列
 
 ```python
-# 塞入
-r.rpush("queue", "task1")   # 右边塞
-r.rpush("queue", "task2")
-r.lpush("queue", "task0")   # 左边塞
+# 塞进去
+r.rpush("queue", "任务A")   # 从右边塞
+r.rpush("queue", "任务B")
 
-# 取出
-r.lpop("queue")             # 左边弹出
-r.rpop("queue")             # 右边弹出
+# 取出来
+r.lpop("queue")             # 从左边弹：'任务A'
+r.lpop("queue")             # '任务B'
 
-# 阻塞式弹(消费者最爱)
-r.blpop("queue", timeout=5) # 等 5 秒,来一个立即返回
+# 阻塞式弹（消费者最爱）
+r.blpop("queue", timeout=5) # 空队列就等 5 秒，来任务立即返回
 ```
 
-**经典用法:简单任务队列**
+**BLPOP 是原子的**。10 个消费者同时 BLPOP，Redis 保证一个任务只会被一个人拿到。这是最简单的任务分发。
 
-```python
-# 生产者
-r.rpush("todo", "任务A")
+**List 的死穴**：不支持优先级。VIP 单子塞进去，也得排在普通单后面。
 
-# 消费者
-while True:
-    _, task = r.blpop("todo", timeout=10)
-    if task:
-        do_work(task)
-```
-
-**BLPOP 是原子的**。10 个消费者同时 BLPOP,同一个任务只会被一个人拿到。
-
-**局限**:List 不支持"按优先级排序",只能 FIFO 或 LIFO。要优先级用 ZSET。
-
-### 3.4 Set — 去重
-
-**心智模型**:一个不重复的元素集合。
+### 3.5 Set：去重
 
 ```python
 r.sadd("tags:post_1", "python", "redis", "tutorial")
-r.sadd("tags:post_1", "python")   # 已存在,无效果
-r.smembers("tags:post_1")
-r.sismember("tags:post_1", "python")  # True
-r.scard("tags:post_1")             # 元素个数
+r.sadd("tags:post_1", "python")   # 重复，无效果
+r.smembers("tags:post_1")          # {'python', 'redis', 'tutorial'}
+r.sismember("tags:post_1", "python")  # True，快速判断存在性
 ```
 
-**常用场景**:去重、标签、好友关系。
+用于打标签、判断"这个人是不是我好友"这类场景。跟队列关系不大，简单过一下。
 
-### 3.5 Sorted Set (ZSET) — 优先级队列的秘密武器
+### 3.6 ZSET：优先级队列的秘密武器
 
-**心智模型**:Set + 每个元素带一个分数(score),**自动按分数排序**。
+**这个是重头戏**。
 
-**这是调度系统里最重要的数据结构**。
+ZSET = Set + 每个元素带一个分数（score）。**Redis 会按分数自动排好序**。
+
+想象一个 VIP 排号系统：
+
+```python
+# 塞进去：{名字: 分数}
+r.zadd("waitlist", {"Alice": 100, "Bob": 50, "VIP_Carol": 5})
+
+# 按分数从小到大取所有
+r.zrange("waitlist", 0, -1, withscores=True)
+# [('VIP_Carol', 5.0), ('Bob', 50.0), ('Alice', 100.0)]
+#     ↑ VIP 天然排在最前面
+```
+
+分数越小越靠前。所以你想让谁靠前，给他小分数（甚至负数）。
+
+**ZSET 的核心 API**（这几个你以后会反复用）：
 
 ```python
 # 塞入
-r.zadd("leaderboard", {"Alice": 100, "Bob": 85, "Carol": 92})
+r.zadd("q", {"task1": 100})
 
-# 按分数从小到大取
-r.zrange("leaderboard", 0, -1, withscores=True)
-# [('Bob', 85.0), ('Carol', 92.0), ('Alice', 100.0)]
+# 幂等塞入：已存在就不动
+r.zadd("q", {"task1": 100}, nx=True)
 
-# 按分数从大到小取
-r.zrevrange("leaderboard", 0, -1, withscores=True)
+# 只更新已存在的：不存在就不动
+r.zadd("q", {"task1": 200}, xx=True)
 
-# 取分数在某个区间的
-r.zrangebyscore("leaderboard", 90, 100)  # ['Carol', 'Alice']
+# 按分数区间取
+r.zrangebyscore("q", -100, 50)   # 取分数在 [-100, 50] 的成员
 
-# 弹出分数最小的(原子操作!)
-r.zpopmin("leaderboard")
+# 弹出分数最小的（原子）
+r.zpopmin("q", count=1)
 
-# 只在不存在时添加(幂等入队!)
-r.zadd("leaderboard", {"Dave": 88}, nx=True)
-
-# 只在已存在时更新(visibility 预占的关键!)
-r.zadd("leaderboard", {"Alice": 200}, xx=True)
-
-# 计数
-r.zcard("leaderboard")                       # 总数
-r.zcount("leaderboard", 90, 100)             # 分数区间内数量
+# 删除
+r.zrem("q", "task1")
 ```
 
-**关键参数记住**:
+**你必须记住**这两组用法，后面会一直出现：
 
-- `NX`:不存在才加 → **幂等入队**
-- `XX`:存在才更新 → **visibility 预占**
-- `CH`:返回真的改动了几个 → **区分"新增"和"无变化"**
+- **`ZADD ... NX`** → 幂等入队（反复塞不会重复）
+- **`ZADD ... XX`** → "隐身"技巧的关键（后面讲）
 
 ---
 
-## 4. TTL — Redis 的自愈魔法
+## 4. 过期时间：Redis 最神奇的一个特性
 
-**任何 key 都可以设过期时间**。到期自动删除。这是分布式锁能崩溃自愈的基础。
+Redis 每个 key 都可以设"多久之后自动消失"。
 
 ```python
-# 设置时带过期
-r.set("session", "abc123", ex=3600)      # 1 小时后删(秒)
-r.set("session", "abc123", px=60000)     # 60 秒后删(毫秒)
-
-# 后加过期
-r.expire("session", 3600)
-r.pexpire("session", 60000)
-
-# 查
-r.ttl("session")        # 剩余秒数:3600, -1(永久), -2(不存在)
-r.pttl("session")       # 剩余毫秒数
-
-# 取消/续期
-r.persist("session")
-r.expire("session", 3600)   # 直接重设
+r.set("code", "123456", ex=300)   # 5 分钟后自动删（比如短信验证码）
+r.ttl("code")                     # 查剩余秒数：300、299、298 ...
 ```
 
-**注意**:ZSET 里的成员没有独立 TTL,只能整个 key 过期。想让 ZSET 里单个成员"过期"?用 score 存过期时间戳,配合 `ZRANGEBYSCORE` 清理 — 这就是下面 visibility 的核心思路。
+**为什么这个特性这么重要？**
+
+分布式系统最头疼的一件事：**进程死了怎么办？**
+
+- 传统方案：中心化的"心跳"机制，每 5 秒汇报"我还活着"，超时被判定死亡
+- Redis 方案：任何"表示我在忙"的 key 都带过期时间。**你活着，就每隔一会续期一下；你死了，key 到期自动消失，别人自然接手**
+
+这个想法太优雅了。**不需要中央调度、不需要心跳协议**，全靠 Redis 帮你算时间。
+
+举个例子。你抢了把锁：
+
+```python
+r.set("lock:job", "me", nx=True, ex=60)
+```
+
+正常干完活：
+
+```python
+r.delete("lock:job")   # 主动释放
+```
+
+进程崩溃了：
+
+```
+（什么都不用做）
+60 秒后 → Redis 自己把这个 key 删掉 → 别人可以抢
+```
+
+**这就是"崩溃自愈"**。整个系统不需要监控器，不需要故障切换协议，Redis 的 TTL 帮你搞定。
 
 ---
 
-## 5. 分布式锁 — 从零实现
+## 5. 分布式锁：三个版本演进
 
-### 5.1 最简单版
+现在做点真的东西。假设有一个任务 `job:123`，10 台机器都可能想处理它，我们要保证**同一时刻只有一台机器在处理**。
+
+### 版本 1：最朴素
 
 ```python
-got = r.set("lock:resource", "me", nx=True, ex=60)
-# nx=True: 只在不存在时设置 → 抢锁语义
-# ex=60:   60 秒后过期 → 崩溃自愈
-
+got = r.set("lock:job:123", "me", nx=True, ex=60)
 if got:
     try:
-        do_work()
+        process_job()
     finally:
-        r.delete("lock:resource")
+        r.delete("lock:job:123")
 ```
 
-**这就是分布式锁的核心**。`SET key val NX EX 60` 是**一条原子的 Redis 命令**。
+**这个版本能工作**：
 
-### 5.2 为什么要用 token(防误删)
+- `nx=True`：只有第一个 SET 成功
+- `ex=60`：如果进程崩了，60 秒后锁自动释放
+- 别的机器 `set` 返回 `None`，就跳过
 
-反例:
+**但有个坑**——想象这个场景：
 
-- 进程 A 抢到锁,卡住不干活
-- 60 秒 TTL 到期,锁自动释放
-- 进程 B 抢到同一把锁,开干
-- A 醒过来 `DEL lock:resource` → **把 B 的锁删了!**
-- 进程 C 又能抢到 → A、B、C 同时干
+1. 机器 A 抢到锁，开始处理
+2. A 因为 GC / 网络卡顿 / 磁盘慢，卡了 65 秒
+3. 60 秒时锁自动过期
+4. 机器 B 抢到同一把锁，开始处理
+5. A 缓过神来，跑到 `r.delete("lock:job:123")` → **把 B 的锁删了**
+6. 机器 C 抢到锁，开始处理
+7. **B 和 C 同时在处理 job:123**
 
-修复:每个人生成唯一 token,删锁前先检查是不是自己的。
+这就是**误删锁**问题。
+
+### 版本 2：给锁盖个"我的"章
+
+给每次抢锁都生成一个唯一 token，删锁前先看看是不是自己的：
 
 ```python
 import uuid
 
 token = uuid.uuid4().hex
-got = r.set("lock:resource", token, nx=True, ex=60)
+got = r.set("lock:job:123", token, nx=True, ex=60)
 if got:
     try:
-        do_work()
+        process_job()
     finally:
-        # 只删属于自己的锁
-        current = r.get("lock:resource")
-        if current == token:
-            r.delete("lock:resource")
+        # 只删属于自己的
+        if r.get("lock:job:123") == token:
+            r.delete("lock:job:123")
 ```
 
-**但这里有 bug**:`get` 和 `delete` 是两步,中间可能出问题。修复方法是用 Lua 脚本让两步变原子(下面讲)。
+看起来解决了？**还有 bug**。`get` 和 `delete` 是两步：
+
+1. 机器 A 检查 `get` 返回自己的 token ✓
+2. 就在 A 准备 `delete` 的这一瞬间，A 的锁过期了
+3. 机器 B 抢到锁
+4. 机器 A 执行 `delete` → **又把 B 的锁删了**
+
+问题在于 "检查 + 删除" 不是原子的。需要让它变成原子的。
+
+### 版本 3：Lua 脚本救场
+
+这就要引出下一节的主角。
 
 ---
 
-## 6. Lua 脚本 — 原子性利器
+## 6. Lua 脚本：为什么绕不开
 
-Redis 支持一次执行一段 Lua 脚本,**期间不允许别的命令插入**。这就是"复合原子操作"的秘密。
+Redis 支持一次执行一段小脚本，脚本执行期间**Redis 完全不干别的**（Redis 是单线程的）。这就是让"多步操作变成原子操作"的秘密武器。
 
 ```python
 FENCED_DEL = """
@@ -342,17 +394,22 @@ else
 end
 """
 
-r.eval(FENCED_DEL, 1, "lock:resource", token)
-# 参数:脚本、KEYS 数量、KEYS..., ARGV...
+# 用法
+r.eval(FENCED_DEL, 1, "lock:job:123", token)
 ```
 
-**Lua 脚本约定**:
+参数说明：
 
-- `KEYS[i]`:涉及的 key
-- `ARGV[i]`:其他参数
-- 返回 0/1 表示是否真的删了
+- `FENCED_DEL` → Lua 脚本字符串
+- `1` → 后面的参数里有 1 个是 key
+- `"lock:job:123"` → KEYS[1]
+- `token` → ARGV[1]
+
+**读起来是**："检查这把锁的持有者是不是我，是的话删掉，不是就啥都不干"。整段代码作为一个原子操作在 Redis 里执行，中间不会被打断。
 
 ### 完整的健壮分布式锁
+
+现在把上面的都整合起来：
 
 ```python
 import uuid
@@ -379,93 +436,144 @@ class RedisLock:
         self.ttl_ms = ttl_ms
         self.token = uuid.uuid4().hex
 
-    def acquire(self) -> bool:
+    def acquire(self):
         return bool(self.r.set(self.key, self.token, nx=True, px=self.ttl_ms))
 
-    def release(self) -> bool:
+    def release(self):
         return bool(self.r.eval(self.RELEASE_LUA, 1, self.key, self.token))
 
-    def renew(self) -> bool:
+    def renew(self):
         return bool(self.r.eval(self.RENEW_LUA, 1, self.key, self.token, self.ttl_ms))
 ```
 
-### 自动续期(做长任务)
+用起来：
 
 ```python
-import asyncio
-
-async def with_lock(r, key, ttl_ms, worker):
-    lock = RedisLock(r, key, ttl_ms)
-    if not lock.acquire():
-        return
-    async def renewer():
-        while True:
-            await asyncio.sleep(ttl_ms / 3 / 1000)  # 每 1/3 TTL 续一次
-            if not lock.renew():
-                return   # 锁被抢走了
-    task = asyncio.create_task(renewer())
+lock = RedisLock(r, "lock:job:123", ttl_ms=30_000)
+if lock.acquire():
     try:
-        await worker()
+        process_job()
     finally:
-        task.cancel()
         lock.release()
 ```
 
-**为什么每 1/3 TTL 续一次**?留出 2 次续期失败的缓冲。如果每 1/2 续,失败一次就危险了。
+### 但是——如果任务真的要跑 30 分钟怎么办？
+
+你不能把 TTL 设成 30 分钟——进程崩了要等 30 分钟才自愈，太慢。
+也不能把 TTL 设成 30 秒——任务还没跑完锁就过期了。
+
+**答案：自动续期**。设短 TTL，但业务代码一直在跑的时候，后台每隔一段时间偷偷续一次期。
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def with_renewer(lock):
+    async def renewer():
+        while True:
+            # 每 1/3 TTL 续一次（留出容错空间）
+            await asyncio.sleep(lock.ttl_ms / 3 / 1000)
+            if not lock.renew():
+                return   # 续期失败说明锁已经被别人抢走
+    task = asyncio.create_task(renewer())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+# 使用
+if lock.acquire():
+    try:
+        async with with_renewer(lock):
+            await do_long_work()   # 30 分钟的活也没问题
+    finally:
+        lock.release()
+```
+
+**为什么是 1/3 而不是 1/2**？留出两次续期失败的容错。如果 1/2 就续，一次失败就危险了。1/3 允许连续失败两次仍安全。
 
 ---
 
-## 7. 优先级队列 — ZSET 的正确用法
+## 7. 优先级队列：ZSET 的实战
 
-### 7.1 塞任务(生产者)
+回到主线。我们要做的是**任务队列**。10 台机器，谁快谁抢单，VIP 单先做。
+
+### 第一版：直接用 ZSET
+
+**生产者**（把任务塞进队列）：
 
 ```python
-def enqueue(task_id, priority=0, urgency_secs=0):
-    # 分数编码:priority 权重最大,urgency 次之
-    score = -(priority * 10**10 + urgency_secs)
-    #         负号:让"高优先级"变成"score 小"
-    #         Redis ZSET 默认升序,所以 score 小 = 排前面
+def enqueue(task_id, priority=0):
+    # 分数越小越靠前，所以把 priority 取负
+    score = -priority
     r.zadd("todo", {task_id: score}, nx=True)
-    #                                ↑ 幂等
+    #                                ↑ 幂等：反复塞不会重复入队
 ```
 
-**分数编码技巧**:
-
-用**位段编码**把多个维度打包成一个数字。
-
-```
-分数 = -(priority × 10^10 + urgency_secs)
-       ↑              ↑
-       高位段          低位段
-```
-
-高位段的 1 差异 > 低位段所有可能差异之和,所以**严格分层压制**:priority 永远压过 urgency。
-
-如果你需要三个维度,继续叠:
-
-```python
-score = -(priority * 10**10 + completed_count * 10**8 + urgency_secs)
-```
-
-`completed_count * 10**8`:已完成工序数,让"快做完的单子优先做完"(收敛避免半成品)。
-
-### 7.2 消费者 — 朴素版
+**消费者**（把任务取出来干）：
 
 ```python
 def consume():
-    result = r.zpopmin("todo", count=1)   # 原子:弹出分数最小的
+    result = r.zpopmin("todo", count=1)
     if not result:
         return None
-    return result[0][0]
+    task_id, score = result[0]
+    return task_id
 ```
 
-**问题**:ZPOPMIN 之后任务从队列消失了。如果处理中崩溃 → **任务丢了**。
+**问题**：任务被 pop 出来之后就从队列消失了。如果消费者拿走后崩了，**这个任务永远丢了**。
+
+我们需要一种"取出来但不真消失"的机制。
+
+### 第二版：多维度优先级
+
+先讲优先级怎么做得更细。真实场景里"急"不是一个维度：
+
+- **运维手动插队**：VIP 客户，必须最先
+- **快做完的先做完**：一个任务做了 5/6 了，另一个刚开始，前者优先（避免半成品堆积）
+- **太久没动的**：可怜的老单子，救救它
+
+一个数字怎么装下三个维度？**位段编码**：
+
+```python
+def compute_score(priority, completed_count, urgency_secs):
+    return -(priority * 10**10
+             + completed_count * 10**8
+             + urgency_secs)
+```
+
+想象一个 12 位的数字：`PP CC CCCC CCUU`。前 2 位是 priority，中间 4 位是 completed_count，后面是 urgency。**高位差 1，压过低位所有变化**。
+
+举例：
+
+| 任务 | priority | completed | urgency | 分数 |
+|---|---|---|---|---|
+| VIP 单 | 1 | 0 | 0 | -1e10 |
+| 老半成品 | 0 | 5 | 3600 | -5e8-3600 ≈ -5e8 |
+| 老单 | 0 | 0 | 7200 | -7200 |
+
+严格分层：VIP < 老半成品 < 老单，就是我们想要的顺序。
+
+**这个技巧非常常用**。你想让 ZSET 按几个维度排序，就用位段编码把它们塞进一个 score 里。
 
 ---
 
-## 8. Visibility Timeout — 任务不丢的秘密
+## 8. 隐身机制：Visibility Timeout
 
-**核心思路**:不真弹出,而是把 score 改成"未来"(比如 `now + 5min`),让它临时隐身。
+回到"任务取走后不能真丢"的问题。
+
+### 核心思路
+
+**不要真 pop 出来。而是把它的 score 改成"未来"**，让它临时看不到。
+
+想象超市寄存柜：
+
+- 你存东西 → 柜子上贴张纸条 "占用中，1 小时后自动解锁"
+- 你正常拿走 → 撕掉纸条，柜子空了
+- 你忘了 → 1 小时后柜子自动解锁，管理员可以清理
+
+Redis 里同样的做法：
 
 ```python
 import time
@@ -473,83 +581,85 @@ import time
 def fetch_one():
     now_ms = int(time.time() * 1000)
 
-    # 只看分数 ≤ now_ms 的(可见任务)
+    # 只看分数 ≤ now_ms 的，也就是"现在可见"的
     candidates = r.zrangebyscore("todo", "-inf", now_ms, start=0, num=10)
 
     for task_id in candidates:
-        # 抢一下:用 XX 只在成员存在时更新
+        # 尝试把它的 score 改成 5 分钟后（推向未来 = 临时隐身）
+        # xx=True 关键：只在成员还在时更新
+        # ch=True 让 Redis 告诉我"这次调用真的改动了吗"
         changed = r.zadd(
             "todo",
-            {task_id: now_ms + 5*60*1000},
+            {task_id: now_ms + 5 * 60 * 1000},
             xx=True, ch=True,
         )
         if changed:
-            return task_id   # 抢到了,score 已推到 5 分钟后
+            return task_id   # 抢到了！现在这个任务对别人隐身 5 分钟
     return None
 ```
 
-**为什么这个方案好**:
+**为什么这个方法好**：
 
-- 抓到就"隐身"(score 推到未来),别的 worker 看不到
-- 处理中崩溃?**5 分钟后 score 回到可见区间,别人自动接手**
-- 完全去中心化,无需协调
-- 不用 Lua,单条 ZADD XX 就是原子的
+- **不打架**：10 个 worker 都 zrangebyscore，可能拿到同一批候选。但 `ZADD XX CH` 是原子的，只有一个人真的改动 → 其他人 `changed=0` 跳过
+- **崩溃自愈**：worker 拿走任务后死了 → 5 分钟后 score 回到"可见"区间 → 别人自然接手
+- **不需要额外的"重试机制"**：Redis 帮你处理了
 
-**完成时删除**:
+处理完就正常删除：
 
 ```python
 def complete(task_id):
     r.zrem("todo", task_id)
 ```
 
-### 双保险:再叠一层 lease 锁
-
-visibility 已经防重复取,但生产系统会再叠一把 lease 锁(`SET NX PX`)确保绝对不重复:
+### 完整的一次"抢-做-删"
 
 ```python
 def process_one():
-    task_id = fetch_one()
+    task_id = fetch_one()   # 抢到，任务已隐身
     if not task_id:
         return
 
-    # 二次上锁
-    lock = RedisLock(r, f"lease:{task_id}", ttl_ms=5*60*1000)
+    # 再上一把独占锁（双保险）
+    lock = RedisLock(r, f"lease:{task_id}", ttl_ms=5 * 60 * 1000)
     if not lock.acquire():
-        return
+        return   # 极小概率抢不到，跳过
 
     try:
-        do_work(task_id)
-        r.zrem("todo", task_id)   # 完成
+        do_work(task_id)          # 干活
+        r.zrem("todo", task_id)    # 完成，正式出队
     finally:
         lock.release()
 ```
 
-**为什么要两层**?
+**"为什么要双保险？两层锁不冗余吗？"**
 
-- ZSET visibility 是**队列侧**的隐身,防止其他 worker **取到**同一条
-- lease 锁是**任务侧**的独占,防止两个 worker 都取到时都**执行**同一条
+- **ZSET 隐身**：让别人**取不到**这个任务
+- **lease 锁**：万一有人取到了（比如 ZSET 有短暂并发窗口），保证只有一个人**真的执行**
 
-前者是"取的时候不打架",后者是"退一步说,万一取到了也不打架"。**双保险的目的是可组合的正确性**。
+分层是"深度防御"的思想。**一个防线可能有洞，两个防线的洞不太可能对齐**。
 
 ---
 
-## 9. 分布式信号量 — 全局并发限流
+## 9. 全局并发信号量：10 台机器加起来最多同时干 6 个
 
-需求:"whisper 任务全厂同时最多 6 个在跑"。
+现在场景更复杂了。假设 whisper 语音识别是个重活，我们希望**全公司加起来同时最多 6 个 whisper 任务在跑**，多了下游 GPU 服务扛不住。
 
-**为什么不用简单计数器**?
+10 台机器，每台想跑就跑，怎么保证合计不超 6？
+
+### 反例：简单计数器
 
 ```python
-# 反例
 n = r.incr("sem:whisper")
 if n <= 6:
     do_work()
     r.decr("sem:whisper")
 ```
 
-问题:worker 崩溃 → 没 DECR → 计数永远漏,最终 sem = limit **永久卡死**。
+**这个想法有致命 bug**：worker 崩溃 → 没执行 decr → 计数器永远漏一个 → **最终卡死在 6 无法释放**。
 
-**正确姿势:HASH + Lua**
+### 正确姿势：HASH + Lua
+
+思路：每个正在干活的人往一个 HASH 里写自己的名字。想干活先看 HASH 里有几个名字，少于 6 就把自己加进去。
 
 ```python
 SEM_ACQUIRE_LUA = """
@@ -564,68 +674,82 @@ return 0
 def acquire_slot(field, limit):
     token = uuid.uuid4().hex
     while True:
-        got = r.eval(SEM_ACQUIRE_LUA, 1, f"sem:{field}", limit, token, int(time.time()))
+        got = r.eval(
+            SEM_ACQUIRE_LUA, 1,
+            f"sem:{field}", limit, token, int(time.time()),
+        )
         if got:
             return token
-        time.sleep(0.2)   # 抢不到,退避
+        time.sleep(0.2)   # 抢不到就退避
 
 def release_slot(field, token):
     r.hdel(f"sem:{field}", token)
 ```
 
-**属性**:
+**为什么用 HASH 而不是计数器**？崩溃时 HASH 里会留下一个"僵尸 token"，但你可以用 leader 定期扫描"HASH 里那些 token 的时间戳太老 = 崩溃了 = 清掉"。**HASH 可回溯、可清理，计数器不行**。
 
-- 每个持有者写自己的 token 到 HASH
-- 崩溃 → 定期清理超时 token(可选:token 里带时间戳,leader 定期扫)
-- HLEN 直接反映当前占用数
+**为什么必须用 Lua**？"读 HLEN + 判断 + HSET" 是三步。如果不是原子的，可能出现：
 
-**为什么必须用 Lua**?"读 HLEN + 判断 + HSET"三步不能被其他连接切断,否则会超发。
+- 机器 A 读到 HLEN = 5，判断 5 < 6，准备 HSET
+- 机器 B 读到 HLEN = 5，判断 5 < 6，准备 HSET
+- 两人都 HSET → 最终 HLEN = 7，**超发了**
+
+Lua 让三步变一步，物理上不可能超发。
 
 ---
 
-## 10. QPS 时间槽 — 下游红线保护
+## 10. QPS 时间槽：保护下游
 
-**并发数 ≠ QPS**。
+**并发数和 QPS 是两回事，一定要区分清楚**。
 
-- 并发数 = 同时有几个人在干活
-- QPS = 每秒发出去多少个下游请求
+- **并发数** = 同时有几个人在干活
+- **QPS** = 每秒发出去多少个下游请求
 
-假设 6 个并发 worker 每个每秒发 5 个下游 RPC → 30 QPS,可能压爆下游。
+假设 6 个 whisper worker 各自并发在干活，但每个 worker 内部循环里每秒调 5 次下游 → 合计 30 QPS，可能压爆下游。
 
-**方案**:把时间切成毫秒级槽,每槽只放 1 个请求过。
+下游服务说"我最多每秒接 10 个请求"——你需要**独立的一把闸**来限住 QPS。
+
+### 方案：把时间切成毫秒级槽
+
+一个 QPS = 10 意味着"每 100ms 只放 1 个请求"。所以：
 
 ```python
 import math
 
 def acquire_qps_slot(downstream, qps):
-    slot_width_ms = math.ceil(1000 / qps)  # 例如 qps=10 → 100ms/槽
+    slot_width_ms = math.ceil(1000 / qps)   # qps=10 → 100 ms/槽
 
     while True:
         now_ms = int(time.time() * 1000)
-        slot = now_ms // slot_width_ms
-        key = f"rl:{downstream}:{slot}"
+        slot = now_ms // slot_width_ms       # 当前处于第几个槽
 
-        # 抢这个时间槽,抢到才放行
+        key = f"rl:{downstream}:{slot}"
+        # NX：只有第一个抢到这个槽的能通过
         got = r.set(key, "1", nx=True, px=slot_width_ms * 2)
         if got:
-            return
+            return   # 放行
 
-        # 抢不到 → 睡到下一槽边界
+        # 没抢到 → 睡到下一槽
         sleep_ms = slot_width_ms - (now_ms % slot_width_ms)
         time.sleep(sleep_ms / 1000)
 ```
 
-**属性**:
+**每个下游一组槽**：`rl:caption:12345`、`rl:mediaProcess:12345`……互不干扰。
 
-- 全局强制。开多少实例、多少并发都不会破 QPS 红线
-- 无状态。每个时间槽都是独立 key,Redis 自动过期清理
-- 精度到 1ms
+**跨实例强制**：10 台机器都在 `SET NX`，同一个 slot 只有一台能抢到。**开多少实例都不会破 QPS 红线**。
+
+**跟并发限流的关系**：
+
+- 并发限流（HASH 信号量）：**"同时"** 最多几个人在跑
+- QPS 时间槽：**"每秒"** 最多几次调用
+
+有时候你需要两个都上。比如"最多 6 个 worker 同时跑，但下游合计 QPS 不超 10"。
 
 ---
 
-## 11. 一个最小可用的调度器
+## 11. 一个能跑的最小调度器
 
-把所有东西拼起来:
+把前面所有东西拼起来。**这 100 行代码你可以直接复制去玩**：
 
 ```python
 import redis
@@ -635,7 +759,7 @@ import math
 
 r = redis.Redis(decode_responses=True)
 
-FENCED_DEL = """
+FENCED_DEL_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
     return redis.call('DEL', KEYS[1])
 else
@@ -645,12 +769,13 @@ end
 
 # ---------- 生产者 ----------
 def enqueue(field, task_id, priority=0):
-    """幂等入队"""
-    score = -(priority * 10**10)
+    """幂等入队，priority 越大越靠前"""
+    score = -priority * 10**10
     r.zadd(f"ready:{field}", {task_id: score}, nx=True)
 
-# ---------- 消费者 ----------
-def fetch_one(field, lease_ttl_ms=5*60*1000):
+# ---------- 消费侧 ----------
+def fetch_one(field, lease_ttl_ms=5 * 60 * 1000):
+    """抢一个可见任务，同时把它推向未来（隐身）"""
     now_ms = int(time.time() * 1000)
     candidates = r.zrangebyscore(
         f"ready:{field}", "-inf", now_ms, start=0, num=10
@@ -669,7 +794,7 @@ def try_lock(key, token, ttl_ms):
     return bool(r.set(key, token, nx=True, px=ttl_ms))
 
 def unlock(key, token):
-    return bool(r.eval(FENCED_DEL, 1, key, token))
+    return bool(r.eval(FENCED_DEL_LUA, 1, key, token))
 
 def worker_loop(field):
     while True:
@@ -680,175 +805,186 @@ def worker_loop(field):
 
         token = uuid.uuid4().hex
         lease_key = f"lease:{field}:{task_id}"
-        if not try_lock(lease_key, token, ttl_ms=5*60*1000):
-            continue
+        if not try_lock(lease_key, token, ttl_ms=5 * 60 * 1000):
+            continue   # 别人抢到了，跳过
 
         try:
-            print(f"processing {task_id}")
-            time.sleep(2)  # 模拟工作
-            r.zrem(f"ready:{field}", task_id)
+            print(f"[{field}] processing {task_id}")
+            time.sleep(2)   # 模拟干活
+            r.zrem(f"ready:{field}", task_id)   # 完成，出队
         finally:
             unlock(lease_key, token)
 
-# ---------- 使用 ----------
+# ---------- 试一下 ----------
 if __name__ == "__main__":
     enqueue("whisper", "task_A", priority=1)
-    enqueue("whisper", "task_B", priority=10)  # 更急
+    enqueue("whisper", "task_B", priority=10)   # 更急
     enqueue("whisper", "task_C", priority=0)
 
     worker_loop("whisper")
 ```
 
-跑起来观察:`task_B` 先被处理,然后 `task_A`、`task_C`。
+运行你会看到：`task_B` 先处理，然后 `task_A`，最后 `task_C`。
+
+**可以做的实验**：
+- 开两个终端跑 `worker_loop("whisper")`，看两个 worker 怎么分单
+- 在 worker 干活到一半时 Ctrl+C 杀掉，5 分钟后看另一个终端会不会接手
+- 用 `redis-cli` 敲 `ZRANGE ready:whisper 0 -1 WITHSCORES` 看队列状态变化
 
 ---
 
-## 12. 对应到线上代码:leader.py 逐段拆解
+## 12. 对着看线上代码：leader.py 每一段在干嘛
 
-现在把上面所有 API 对应到我们线上的 `leader.py`(fragment 生产调度器)。
+现在把前面所有概念对应到我们真实生产的 fragment 生产调度器。
 
 ### 12.1 整体架构
 
 ```
-                    ┌───────────────┐
-                    │  Mongo 权威    │
-                    │  materials_core│
-                    └───┬───────▲───┘
-                        │       │
-                  ①扫描 │       │④写回
-                        ▼       │
-                    ┌───────────┴───┐
-                    │ leader        │  ← 每工序 1 个
-                    │ 每 5s 扫库    │
-                    └───┬───────────┘
-                        │
-                  ②投队列
-                        ▼
-              ┌─────────────────┐
-              │ Redis ready ZSET │
-              │ 分数排序          │
-              └───┬─────────────┘
-                  │
-                  ▼
-           worker 消费(下节)
+┌───────────────────────────────┐
+│  Mongo (materials_core)        │  ← 权威数据
+│  记录每个 fragment 的 target 状态 │
+└──────┬──────────────────────▲──┘
+       │ ① 扫库                  │ ④ 写回结果
+       ▼                        │
+┌───────────────────┐            │
+│ leader (每工序 1 个) │            │
+│ 每 5s 扫一次库      │            │
+└──────┬────────────┘            │
+       │ ② 入队                   │
+       ▼                        │
+┌───────────────────┐            │
+│ Redis ready ZSET   │            │
+│ 按优先级排序        │            │
+└──────┬────────────┘            │
+       │ ③ 消费                   │
+       ▼                        │
+┌───────────────────┐            │
+│ worker (多实例)    │────────────┘
+│ 抢锁 → 干活 → 出队 │
+└───────────────────┘
 ```
 
-**核心思想**:Mongo 是权威,Redis 是提醒板。leader 负责把 Mongo 里"待做"的任务同步到 Redis ZSET。
+**核心哲学**：**Mongo 是权威真值，Redis 是低延迟提示板**。任何时候两边不一致，以 Mongo 为准（因为 leader 每 5 秒会重扫一次库自愈）。
 
-### 12.2 leader 选主
+### 12.2 leader 选主：只让一个进程扫库
 
-多实例部署时,不能每台都扫库。所以 leader 用 Redis 分布式锁选主:
+多实例部署时，不能让每台机器都在扫 Mongo（浪费）。用 Redis 分布式锁选出唯一的 leader：
 
 ```python
-# leader.py 简化后
 async def leader_loop(field, *, stop_event):
     token = uuid.uuid4().hex
     while not stop_event.is_set():
-        # 抢主锁
+        # 抢主锁（跟你在 §5 学的一模一样）
         got = await r.set(f"scan:leader:{field}", token, nx=True, px=30_000)
         if not got:
-            await asyncio.sleep(15)   # 别的实例是 leader,退避
+            # 别的实例是 leader，退避后再试
+            await asyncio.sleep(15)
             continue
 
         try:
+            # 抢到了！进入 leader 会话
             while await still_leader(field, token):
                 await scan_and_enqueue(field)
-                await sleep(5)
+                await asyncio.sleep(5)
         finally:
-            # 释放主锁(fenced_del,确保还是自己的)
+            # 释放主锁（记得用 fenced_del，见 §6）
             await fenced_del(f"scan:leader:{field}", token)
 ```
 
-对应到基础 API:
+**每工序一个 leader** 意味着有 `scan:leader:whisper`、`scan:leader:media`、`scan:leader:caption` 好几把独立的主锁。一个工序的 leader 卡住不影响其他工序。
 
-- **抢主**:`SET scan:leader:whisper <token> NX PX 30000` → 只有一个实例能拿到
-- **续锁**:每轮末尾 `PEXPIRE`,防止扫描过程中锁过期
-- **让位**:每轮开始前 `GET` 校验 token,如果被抢走(比如本实例卡顿导致锁过期)则退出
-- **fenced 释放**:Lua 脚本,只删自己的
+**leader 崩溃怎么办**？TTL 30 秒到期后锁自动消失，别的机器抢到成为新 leader。**这就是 §4 讲的自愈的实际应用**。
 
-**为什么每工序一个 leader**?whisper / media / caption 各有独立的 `scan:leader:<field>` key。一个工序 leader 卡了不影响其他工序调度。
-
-### 12.3 scan_and_enqueue 扫库入队
+### 12.3 scan_and_enqueue：扫库入队
 
 ```python
 async def scan_and_enqueue(field):
+    # 从 Mongo 里查还没做完的 fragment
     async for doc in mongo.find(scan_filter(field)):
         score = compute_score(
             priority=doc["reconcile_priority"],
             completed_count=doc["completed_count"],
             urgency_secs=int(time.time()) - doc["last_touch"],
         )
-        # NX:已经在队列里的不重投
+        # 幂等入队（见 §7）
         await r.zadd(f"ready:{field}", {doc["_id"]: score}, nx=True)
 ```
 
-对应到基础 API:
-
-- **优先级编码**:`compute_score = -(priority × 10^10 + completed_count × 10^8 + urgency_secs)`
-- **幂等入队**:`ZADD ready:<field> {fid: score} NX` → 反复扫库不重复入队
-- **动态优先级**:如果外部改了 `reconcile_priority`,下轮扫描重新算分,新加进来的以新分数入队(旧的已经在队列里的可以用 `ZADD GT` 特殊处理,这里略)
+- **`compute_score`**：§7 讲的位段编码，把三维打包成一个 score
+- **`ZADD ... NX`**：反复扫库同一个 fragment 不会被重复投递
+- **动态优先级**：如果 Mongo 里改了 `reconcile_priority`，下一轮扫描算出新分数（但因为 NX，只对新加进来的生效——对已经在队列里的，需要用 `ZADD ... GT` 或者主动 `ZREM` 后重投）
 
 ### 12.4 定期打扫卫生
 
-leader 除了扫库入队,还负责几件低频维护工作:
+leader 除了扫库入队，还负责几件低频维护工作。这些工作在同一个 leader 会话里做，因为**只需要一个进程做**：
 
 ```python
-async def leader_session(field, token, *, stop_event):
-    last_sweep = 0
-    while not stop_event.is_set():
-        # 每 5 秒
-        await scan_and_enqueue(field)
+last_zombie_sweep = 0
+last_orphan_rescue = 0
 
-        # 每 90 秒(低频)
-        if time.time() - last_sweep > 90:
-            await sweep_zombies(field)          # 回收崩溃 worker 的锁
-            await sweep_exhausted(field)        # 超过重试上限的 → 终态
-            await rescue_visibility_orphans(field)  # 被隐身但没人接手的
-            last_sweep = time.time()
+while await still_leader(field, token):
+    # 高频：每 5 秒
+    await scan_and_enqueue(field)
 
-        await sleep(5)
+    # 低频：每 90 秒
+    if time.time() - last_zombie_sweep > 90:
+        await sweep_zombies(field)          # 清崩溃 worker 留下的 running 状态
+        await sweep_exhausted(field)        # 超过重试上限的打成永久失败
+        await rescue_visibility_orphans(field)   # 隐身后没人接手的
+        last_zombie_sweep = time.time()
+
+    await asyncio.sleep(5)
 ```
 
-**Visibility 孤儿救援**是个有意思的场景:
+**Visibility 孤儿救援** 是个很有意思的场景，我详细讲讲：
 
-- 某个任务被 worker 抓走,score 推到未来
-- worker 处理中重启 / 被 kill / 网络分区
-- 任务的 score 会自然到期(再变可见)
-- 但如果 leader 觉得"这个 score 已经过了,还在这里没被处理",就主动把 score 刷回优先级 score,加速接管
+正常流程：
+- worker 抢到任务 → 把 ZSET score 推到 `now + 5min`（隐身）
+- 干完 → `ZREM` 删除
+- 崩溃 → 5 分钟后 score 到期回到"可见"区间
 
-代码:
+**异常场景**：worker 抢到任务后，把 score 推到了 `now + 5min`，然后进程被 kill 且**恢复很慢**（比如新实例还没起来）。这个任务就一直在 ZSET 里挂着，没人处理。
+
+leader 定期扫一下：**"哪些成员的 score 在 (0, now] 区间？也就是本该可见但一直没被 pop 的？"** 这些就是孤儿：
 
 ```python
 async def rescue_visibility_orphans(field):
     now_ms = int(time.time() * 1000)
-    # 分数在 (0, now_ms] 的成员:曾经被推到未来,现在已经到期还在队列里
     orphans = await r.zrangebyscore(f"ready:{field}", 0, now_ms)
     for fid in orphans:
+        # 重新查一次 Mongo 算个真实分数
         doc = await mongo.find_one({"_id": fid})
         new_score = compute_score(doc)
+        # XX：只更新（不新增，因为它本来就在）
         await r.zadd(f"ready:{field}", {fid: new_score}, xx=True)
 ```
 
+这样孤儿从"隐身刚过期"回到"最高优先级"，很快被接手。
+
 ---
 
-## 13. 对应到线上代码:worker.py 逐段拆解
+## 13. 对着看线上代码：worker.py 每一段在干嘛
 
-worker 负责从 ZSET 消费任务、抢锁、干活、释放。核心函数是 `process_one`。
+worker 负责从 ZSET 消费任务、抢独占锁、干活、清理。核心函数叫 `process_one`。
 
-### 13.1 单次任务处理:5 条正确性规则
+### 13.1 五条正确性规则
+
+我从生产代码里翻译一版清晰的：
 
 ```python
 async def process_one(field, fragment_id, config):
     token = uuid.uuid4().hex
-    key = f"lease:{field}:{fragment_id}"
+    lease_key = f"lease:{field}:{fragment_id}"
     lease_ttl_ms = config.lease_ttl_s * 1000
 
-    # === 规则 1:抢 lease(SETNX) ===
-    if not await r.set(key, token, nx=True, px=lease_ttl_ms):
-        return   # 抢不到 = 别的 worker 在做
+    # === 规则 1：抢独占 lease ===
+    # SETNX 抢到才继续，抢不到说明别人在处理
+    if not await r.set(lease_key, token, nx=True, px=lease_ttl_ms):
+        return
 
     try:
-        # === 规则 2:visibility 预占 ===
+        # === 规则 2：Visibility 预占 ===
+        # 把 ZSET 里这条推到 5 分钟后，让别的 worker 看不到
         now_ms = int(time.time() * 1000)
         await r.zadd(
             f"ready:{field}",
@@ -856,41 +992,51 @@ async def process_one(field, fragment_id, config):
             xx=True,
         )
 
-        # === 规则 3:二次校验(幂等闸)===
+        # === 规则 3：二次校验 ===
+        # 从 Mongo 重读，确认这条真的还需要做
+        # (可能在我们抢锁前已经被别的路径做完了)
         doc = await mongo.find_one({"_id": fragment_id})
         if doc is None or not should_still_build(field, doc):
-            await fenced_zrem(field, fragment_id, key, token)
+            # 不用做了，出队走人
+            await fenced_zrem(field, fragment_id, lease_key, token)
             return
 
-        # === 规则 4:干活时后台续锁 ===
-        async with lease_renewer(key, token, lease_ttl_ms):
+        # === 规则 4：干活时后台续锁 ===
+        # 用 async with 起后台续锁协程，覆盖整个干活过程
+        async with lease_renewer(lease_key, token, lease_ttl_ms):
             result = await fetch_and_persist(
-                FragmentFetchCommand(
-                    id=fragment_id,
-                    targets=[field],
-                    ...
-                )
+                FragmentFetchCommand(id=fragment_id, targets=[field])
             )
 
-        # === 规则 5:fenced 出队 ===
-        # 只有锁还是自己的才 zrem,防止误删接管者的成果
-        await fenced_zrem(field, fragment_id, key, token)
+        # === 规则 5：Fenced 出队 ===
+        # 只有锁还是自己的才 zrem，防止误删别人的成果
+        await fenced_zrem(field, fragment_id, lease_key, token)
 
     finally:
-        await fenced_del_lease(key, token)
+        await fenced_del_lease(lease_key, token)
 ```
 
-### 13.2 五条规则对应的基础 API
+### 13.2 每条规则对应我们讲过的哪个概念
 
-| 规则 | Redis 命令 | 对应 tutorial 章节 |
+| 规则 | Redis 操作 | 对应本文哪节 |
 |---|---|---|
 | 1. 抢独占 lease | `SET key token NX PX` | §5 分布式锁 |
-| 2. Visibility 预占 | `ZADD ready XX` 推 future | §8 visibility |
-| 3. 二次校验 | 读 Mongo 判断 | 幂等闸,防重复劳动 |
-| 4. 后台续锁 | Lua `GET+PEXPIRE` 每 lease_ttl/3 秒 | §6 Lua + §5 续期 |
-| 5. Fenced 出队 | Lua `GET+ZREM` 校验 token | §6 Lua 原子性 |
+| 2. Visibility 预占 | `ZADD ready XX` 推 future | §8 隐身机制 |
+| 3. 二次校验 | 读 Mongo 判断 | 幂等闸，防重复劳动 |
+| 4. 后台续锁 | Lua `GET+PEXPIRE` | §6 Lua + 自动续期 |
+| 5. Fenced 出队 | Lua `GET+ZREM` | §6 Lua 原子性 |
 
-### 13.3 lease_renewer 后台续期
+**为什么规则 3 特别重要？** 想象这个场景：
+
+- 用户在网页上点了"手动重试"按钮 → 服务直接调 `fetch_and_persist` → 任务完成了
+- 与此同时 leader 的 ZSET 里还挂着这条任务
+- worker 从 ZSET 拿到，抢锁成功，如果**直接开始干活**，就会重复处理
+
+规则 3 的二次校验就是防这种情况：**"我抢到锁只代表我有权干，还得确认这活儿真的还需要干"**。
+
+### 13.3 lease_renewer：后台续锁
+
+对应到 §6 讲的自动续期，具体这样写：
 
 ```python
 from contextlib import asynccontextmanager
@@ -899,32 +1045,35 @@ from contextlib import asynccontextmanager
 async def lease_renewer(key, token, ttl_ms):
     async def renew_loop():
         while True:
-            await asyncio.sleep(ttl_ms / 3 / 1000)
+            await asyncio.sleep(ttl_ms / 3 / 1000)   # 每 1/3 TTL 续一次
             renewed = await r.eval(RENEW_LUA, 1, key, token, ttl_ms)
             if not renewed:
-                return   # 锁被抢走
+                return   # 锁被别人抢走了，或者已过期
+
     task = asyncio.create_task(renew_loop())
     try:
         yield
     finally:
         task.cancel()
+
+# 用起来
+async with lease_renewer(lease_key, token, lease_ttl_ms):
+    await do_actual_work()   # 任意长时间
 ```
 
-**为什么用 `async with`**?
+用 `async with` 的原因：**自动生命周期管理**。业务代码正常退出、异常退出、被 cancel，续锁协程都会被正确清理。**这是 Python 里管理"后台伴生任务"的标准姿势**。
 
-自动管理生命周期。业务代码 `async with lease_renewer(...): await do_work()`,退出 block 时(不管正常还是异常)自动 cancel 续期协程。
+### 13.4 fenced_zrem：为什么不能直接 zrem
 
-### 13.4 fenced_zrem — 为什么不能直接 zrem?
+**反例场景**：
 
-**反例**:
+1. worker A 抢到 lease，开始干活
+2. A 网络卡了 60 秒，lease 过期
+3. worker B 抢到同一个 lease，开始干活
+4. A 网络恢复，干完了，跑到 `r.zrem` 把任务从队列删除
+5. **但 B 还没干完！** ZREM 之后如果 B 失败了，这个任务再也不会被重试
 
-- worker A 抢到 lease,开始干活
-- A 网络卡了,lease 过期
-- worker B 抢到 lease,开始干活
-- A 网络恢复,干完了,直接 `ZREM` 把任务从队列删掉
-- **但 B 还在干这个任务!** ZREM 之后 B 的任务如果失败,再也不会被重试
-
-**修复**:
+修复：删除前用 Lua 校验锁还是我的：
 
 ```python
 FENCED_ZREM_LUA = """
@@ -938,51 +1087,50 @@ end
 async def fenced_zrem(field, fragment_id, lease_key, token):
     await r.eval(
         FENCED_ZREM_LUA,
-        2,
-        lease_key, f"ready:{field}",
-        token, str(fragment_id),
+        2,                                    # 2 个 key
+        lease_key, f"ready:{field}",         # KEYS[1], KEYS[2]
+        token, str(fragment_id),             # ARGV[1], ARGV[2]
     )
 ```
 
-**规则**:任何"决定性写操作"(把任务从队列删除、写库标 success)前,都要用 fencing token 校验锁还是自己的。
+**"任何决定性写操作前，都要校验锁还是自己的"** —— 这是分布式系统的重要原则。释放锁、写库标 success、从队列删除，都要 fencing。
 
-### 13.5 三层并发控制
+### 13.5 三层并发管理
 
-上面的 `process_one` 处理**单个**任务。真实 worker 是这样跑的:
+上面的 `process_one` 处理单条。真实 worker 是这样跑的：
 
 ```python
 async def worker_loop(field):
     while True:
-        # 计算当前该有多少个并发
-        limit = resolve_concurrency(field)   # 见下
+        # 计算这一轮该有多少个 consumer
+        limit = resolve_concurrency(field)   # 后面讲
 
-        # 起一个 producer + N 个 consumer 的流式管道
         queue = asyncio.Queue(maxsize=limit)
 
         async def producer():
+            """从 ZSET 抓一批 → 隐身 → 塞进本地 Queue"""
             while True:
-                # 从 ZSET 抓一批
+                now_ms = int(time.time() * 1000)
+                # 从 2048 个候选里随机采样，减少多实例哄抢
                 candidates = await r.zrangebyscore(
-                    f"ready:{field}", "-inf", int(time.time()*1000),
+                    f"ready:{field}", "-inf", now_ms,
                     start=0, num=2048,
                 )
-                # 随机采样 N 个防止多实例哄抢
                 picked = random.sample(candidates, min(limit, len(candidates)))
                 for fid in picked:
-                    # visibility 预占
                     changed = await r.zadd(
                         f"ready:{field}",
                         {fid: now_ms + lease_ttl_ms},
                         xx=True, ch=True,
                     )
                     if changed:
-                        await queue.put(fid)
+                        await queue.put(fid)   # 塞进本地队列，等 consumer
 
         async def consumer():
+            """从本地 Queue 取，抢全局信号量，处理"""
             while True:
                 fid = await queue.get()
-                # 抢全局并发信号量
-                slot = await acquire_slot(field, limit)
+                slot = await acquire_slot(field, limit)   # §9 全局并发
                 if not slot:
                     continue
                 try:
@@ -991,66 +1139,65 @@ async def worker_loop(field):
                     await release_slot(field, slot)
 
         # 起 1 个 producer + N 个 consumer
-        ...
+        await asyncio.gather(producer(), *[consumer() for _ in range(limit)])
 ```
 
-**三层并发决策**:
+**这里有三层并发控制**：
 
-| 层 | 作用 | Redis 命令 |
+| 层 | 干嘛 | 对应本文哪节 |
 |---|---|---|
-| 全局信号量 | 跨实例合计并发 ≤ 上限 | HASH + Lua HLEN 判断 |
-| 本地并发 | 单实例最多起 N 个 consumer | Python asyncio.Queue |
-| Producer 采样 | 从 2048 候选窗口随机抽 N 个 | `random.sample` |
+| Producer 采样 | 从 2048 候选里随机 N 个，避免多实例同时抢同一批 | §8 隐身机制的扩展 |
+| 本地 Queue | 单实例内部生产-消费管道，控制单机并发 | Python asyncio 基础 |
+| 全局信号量 | 跨实例合计并发不超 limit | §9 分布式信号量 |
 
-**为什么要"随机采样 2048"**?
+**为什么随机采样 2048**？
 
-多实例场景。10 个实例的 producer 都 `ZRANGEBYSCORE ... LIMIT 0 N`,拿到的是同一批 N 条。10 个人抢同 N 条 → visibility XX 大部分抢失败 → 浪费。
+想象 10 台机器，每台的 producer 都干 `ZRANGEBYSCORE ... LIMIT 0 8`（要 8 个）。10 个人拿到的是**完全相同的前 8 个**。然后 10 个人 `ZADD XX` 抢，只有 1 个人成功 → 剩下 9 个人白跑一趟。
 
-改成:每人取 2048 条候选,从里面随机抽 N 条,**天然错开,减少抢锁失败率**。
+改成"每人拿 2048 个候选，从里面随机抽 8 个"，10 个人各抽各的，**天然错开**。多数情况下每个任务只有一两个人抢，抢锁成功率大幅提升。
 
-### 13.6 QPS 硬红线
+### 13.6 QPS 保护在哪一层
 
-worker 干活时会调下游服务(转码 / LLM / ASR)。合计 QPS 由 SETNX 时间槽保护:
+worker 干活时最终会调下游服务（转码、LLM、语音识别）。QPS 红线在调用点保护：
 
 ```python
-# 在 ops/media_fetch.py 里
+# 类似于 ops/media_fetch.py 里
 async def call_media_process(...):
-    await acquire_qps_slot("mediaProcess", qps=50)   # §10
-    await rpc_call(...)
+    await acquire_qps_slot("mediaProcess", qps=50)   # §10 时间槽
+    return await rpc_call(...)
 ```
 
-**并发和 QPS 是两个正交的旋钮**:
+**并发和 QPS 是两把独立的闸**：
 
-- 6 个并发 worker,每个每秒发 3 个 RPC → 18 QPS
-- 6 个并发 worker,每个每秒发 1 个 RPC → 6 QPS
+- 6 个 worker 并发跑，每个每秒调 3 次下游 → 18 QPS
+- 6 个 worker 并发跑，每个每秒调 10 次下游 → 60 QPS
 
-**只加信号量不加时间槽**,同一批 worker 内部循环可能瞬间发很多请求打爆下游。
+**只加信号量不加时间槽**，worker 内部循环调用可能瞬间打爆下游。所以生产环境两个都要有。
 
 ---
 
-## 14. 常见坑与调试技巧
+## 14. 你会踩的坑
 
-### 坑 1:`decode_responses` 忘开
+**坑 1：忘了 `decode_responses`**
 
 ```python
 r = redis.Redis()
-r.get("k")   # b'v' 是 bytes,不是 str
-
+r.get("k")   # 返回 b'v' bytes，不是 str
 # 修复
 r = redis.Redis(decode_responses=True)
 ```
 
-### 坑 2:忘了 NX/XX
+**坑 2：ZADD 忘了 NX/XX**
 
 ```python
-# ❌ 每次扫库都覆盖 score,把已经在队列里的优先级刷掉
+# ❌ 每次扫库都覆盖 score，把已在队列里的优先级刷掉
 r.zadd("todo", {"task1": new_score})
 
 # ✅ 已存在的不动
 r.zadd("todo", {"task1": new_score}, nx=True)
 ```
 
-### 坑 3:分布式锁不带 TTL
+**坑 3：分布式锁不带 TTL**
 
 ```python
 # ❌ 崩溃就死锁
@@ -1060,13 +1207,13 @@ r.set("lock", "me", nx=True)
 r.set("lock", "me", nx=True, ex=60)
 ```
 
-### 坑 4:删锁不校验 token
+**坑 4：删锁不校验 token**
 
 一定用 Lua fenced_del。
 
-### 坑 5:用 KEYS 扫全库
+**坑 5：用 KEYS 扫全库**
 
-`KEYS *` 会阻塞 Redis。**永远用 SCAN**:
+`KEYS *` 会阻塞整个 Redis。**永远用 SCAN**：
 
 ```python
 cursor = 0
@@ -1078,37 +1225,35 @@ while True:
         break
 ```
 
-### 坑 6:内存不释放
+**坑 6：内存不释放**
 
-Redis 所有 key 都在内存里。忘设 TTL 或用无界数据结构(List/ZSET 不断塞)会 OOM。
+Redis 所有 key 都在内存里。忘设 TTL 或用无界数据结构（List/ZSET 不断塞）会 OOM。
 
-**建议**:
-
+**建议**：
 - 任何有生命周期的 key 都设 TTL
 - 队列 ZSET 定期清理已完成的
 - 用 `INFO memory` 监控
 
-### 调试神器:redis-cli
+### 调试神器：redis-cli
 
 ```bash
 redis-cli
-> KEYS *                       # 列所有 key(生产慎用!)
+> KEYS *                       # 列所有 key（生产慎用！）
 > SCAN 0 MATCH "lease:*"       # 分批扫
 > TYPE mykey                   # 看类型
 > TTL mykey                    # 剩余过期时间
-> ZRANGE ready:whisper 0 -1 WITHSCORES   # 看队列内容
+> ZRANGE ready:whisper 0 -1 WITHSCORES   # 看队列内容和分数
 > HGETALL sem:whisper          # 看信号量占用
 > INFO memory                  # 内存使用
+> MONITOR                      # 实时看所有命令（生产不能用！）
 ```
 
----
-
-## 15. API 速查表(贴墙上)
+### API 速查表
 
 | 目的 | 命令 | 章节 |
 |---|---|---|
 | 抢分布式锁 | `SET key val NX PX 60000` | §5 |
-| 释放锁 | Lua `GET + DEL` (校验 token) | §6 |
+| 释放锁 | Lua `GET + DEL`（校验 token） | §6 |
 | 续锁 | Lua `GET + PEXPIRE` | §6 |
 | 幂等入队 | `ZADD key {member: score} NX` | §7 |
 | Visibility 预占 | `ZADD key {member: future_ts} XX CH` | §8 |
@@ -1116,31 +1261,31 @@ redis-cli
 | 优先级弹出 | `ZPOPMIN key` | §7 |
 | 计数器 | `INCR / INCRBY / DECR` | §3.1 |
 | 缓存带 TTL | `SET key val EX 3600` | §4 |
-| 简单队列生产 | `RPUSH key val` | §3.3 |
-| 简单队列消费 | `BLPOP key timeout` | §3.3 |
-| 全局并发计数 | Lua `HLEN + HSET` | §9 |
+| 简单队列 | `RPUSH` + `BLPOP` | §3.4 |
+| 全局并发 | Lua `HLEN + HSET` | §9 |
 | QPS 红线 | `SET rl:xxx:slot NX PX` | §10 |
 
 ---
 
-## 16. 学习路径建议
+## 15. 一句话总结
 
-1. **先玩通 5 种数据结构**,用 `redis-cli` 手动敲每个命令
-2. **理解 `NX / XX / EX / PX` 四个参数**(Redis 分布式的灵魂)
-3. **手写一个分布式锁**(`SET NX PX` + Lua fenced_del)
-4. **手写一个优先级队列**(ZSET + visibility)
-5. **回头看线上真实代码** — leader.py 和 worker.py 每一行都能对应到上面的模式
+看到最后你应该体会到：**Redis 提供的能力其实不多——原子操作、TTL、几种数据结构**。但把它们组合起来能搭出让人惊讶的复杂系统。
 
----
+我用四句话概括这整套东西：
 
-## 一句话总结
-
-> **一张单子在 Mongo,一块白板在 Redis。leader 扫库喂白板,worker 抢白板干活。**
+> **数据的家在 Mongo，任务的告示板在 Redis。**
 >
-> **并发靠信号量,QPS 靠时间槽,正确靠版本号 CAS,自愈靠锁自动过期。**
+> **leader 一个人扫库贴告示，worker 大家抢告示干活。**
+>
+> **并发数靠信号量拦住，QPS 靠时间槽拦住，正确性靠版本号 CAS，崩溃靠锁自动过期。**
+>
+> **抓任务先隐身，干活时续锁，写结果前校验，删任务前 fencing。**
 
-Redis 提供的能力其实很少:原子操作、TTL、数据结构。但把它们组合起来,能搭出令人惊讶的复杂系统。**关键是理解每个 API 在解决什么问题**,而不是死记命令。
+**你现在的行动**：
 
----
+1. 打开 `redis-cli`，把 §3 的每种数据结构手动敲一遍
+2. 复制 §11 的 100 行代码跑起来，开两个终端观察行为
+3. 回头看你手头的项目，找一处用 Redis 的地方，把它对应到本教程的某一节
+4. 有问题？回来看对应的章节
 
-*如果觉得有用,可以对着你手边一份用 Redis 做队列的代码,把 tutorial 里的模式一一对号入座。多数"看起来很复杂"的调度系统,拆开都是这些基础模式的组合。*
+多数看起来复杂的调度系统，拆开都是这些基础模式的组合。**理解了每个 API 在解决什么问题，你就能看懂任何一份线上代码**。
